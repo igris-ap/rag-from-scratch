@@ -1,0 +1,5 @@
+pymupdf
+pymupdf4llm
+psycopg2-binary
+sentence-transformers
+gradio>=6.0.0
