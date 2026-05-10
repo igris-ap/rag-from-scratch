@@ -104,7 +104,7 @@ analyze_query()              ← rewrite, detect unclear, split multi-part
 ### 1. Clone the repo
 
 ```bash
-git clone https://github.com/yourusername/rag-from-scratch.git
+git clone https://github.com/igris-ap/rag-from-scratch.git
 cd rag-from-scratch
 ```
 
