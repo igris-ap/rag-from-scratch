@@ -1,6 +1,6 @@
 # RAG from Scratch
 
-A fully working **Retrieval-Augmented Generation (RAG)** system built from scratch in Python — no LangChain, no LangGraph, no vector database SDKs. Just Python, Postgres, and Ollama.
+A fully working **Agentic Retrieval-Augmented Generation (RAG)** system built from scratch in Python — no LangChain, no LangGraph, no vector database SDKs. Just Python, Postgres, and Ollama.
 
 ![Python](https://img.shields.io/badge/Python-3.10+-blue)
 ![Postgres](https://img.shields.io/badge/Postgres-pgvector-336791)
@@ -12,18 +12,23 @@ A fully working **Retrieval-Augmented Generation (RAG)** system built from scrat
 
 ## What this is
 
-Most RAG tutorials use LangChain or LlamaIndex — frameworks that hide the actual mechanics behind layers of abstraction. This project implements every component manually so you can see exactly how RAG works:
+Most RAG tutorials use LangChain or LlamaIndex — frameworks that hide the actual mechanics behind layers of abstraction. This project implements every component manually so you can see exactly how agentic RAG works:
 
 - How PDFs become searchable chunks
 - How text becomes vectors and gets stored in a database
-- How a query finds the right chunks
-- How the LLM generates a grounded answer
-- How conversation history and query rewriting make it agentic
+- How an LLM selects retrieval tools at runtime based on the query
+- How the system evaluates its own retrieval and retries if context is insufficient
+- How the LLM critiques and revises its own answers before returning them
+- How conversation history and query rewriting resolve references across turns
 
 ---
 
 ## Features
 
+- **Agentic tool selection** — LLM picks between vector search, BM25 keyword search, and memory recall based on the query type
+- **Retrieval reflection loop** — after retrieval, the LLM evaluates whether context is sufficient; if not, it rewrites the query and retries (up to 3 attempts)
+- **Answer self-critique** — generated answers are evaluated by a second LLM call and revised if they miss the question or contradict the context
+- **BM25 keyword search** — exact-match retrieval for technical terms, constants, and proper nouns; implemented from scratch without Elasticsearch
 - **Parent-child chunking** — search small chunks for precision, generate from large chunks for context
 - **Hybrid storage** — child chunks as vectors in Postgres/pgvector, parent chunks as JSON on disk
 - **Query intelligence** — detects vague questions, rewrites for clarity, splits multi-part questions
@@ -40,25 +45,43 @@ Most RAG tutorials use LangChain or LlamaIndex — frameworks that hide the actu
 User question
       │
       ▼
-summarize_conversation()     ← compress history into 1-2 sentences
+summarize_conversation()      ← compress history into 1-2 sentences
       │
       ▼
-analyze_query()              ← rewrite, detect unclear, split multi-part
+analyze_query()               ← rewrite, detect unclear, split multi-part
       │
       ├── unclear → ask for clarification
       │
       └── clear → for each sub-question:
-                    retrieve()        ← search child chunks in pgvector
-                    load_parent()     ← fetch full context from disk
-                    build_prompt()    ← assemble RAG prompt
-                    chat()            ← call Ollama LLM
-                         │
-                         ▼
-                  aggregate_answers() ← merge if multiple sub-questions
-                         │
-                         ▼
+                        │
+                        ▼
+                  [AGENT LOOP]
+                        │
+                        ▼
+                  select_tool()         ← LLM picks tool based on query type
+                        │
+                        ▼
+                  call_tool()           ← vector_search | keyword_search | recall_memory
+                        │
+                        ▼
+                  reflect_on_retrieval() ── SUFFICIENT? ──► generate_answer()
+                        │                                          │
+                        └── NO → rewrite query → retry (×3)       ▼
+                                                           critique_and_revise()
+                                                                   │
+                                                           PASS? ──► return answer
+                                                           FAIL? ──► revise → return
+                        │
+                        ▼
+                  aggregate_answers()   ← merge if multiple sub-questions
+                        │
+                        ▼
                     Final answer
 ```
+
+**LLM calls per query:**
+- Fast path (clear query, sufficient retrieval, answer passes critique): **5 calls**
+- Worst path (vague query, 3 retries, answer revised): **up to 10 calls**
 
 ### File structure
 
@@ -66,11 +89,16 @@ analyze_query()              ← rewrite, detect unclear, split multi-part
 .
 ├── app.py                  # Gradio web UI
 ├── main.py                 # CLI entry point + pipeline wiring
+├── rag.py                  # Top-level answer() — routes through agent loop
+├── agent.py                # Agentic core: tool selection, reflection, critique
+├── tools.py                # Tool registry: vector search, BM25, memory recall
+├── prompts.py              # All LLM prompts in one place
 ├── llm.py                  # Ollama HTTP client (no SDK)
 ├── chunker.py              # PDF → parent + child chunks
 ├── vector_store.py         # Embeddings + Postgres/pgvector
-├── rag.py                  # Retrieve → prompt → generate
 ├── query_intelligence.py   # Query rewriting + conversation summary
+├── eval.py                 # Retrieval quality evaluation script
+├── eval_questions.json     # Sample evaluation question set
 ├── docs/                   # Put your PDFs here
 ├── markdown/               # Auto-generated markdown from PDFs
 ├── parent_store/           # Auto-generated parent chunk JSON files
@@ -87,6 +115,7 @@ analyze_query()              ← rewrite, detect unclear, split multi-part
 | LLM | Ollama (llama3.2) | Local, free, no API key |
 | Embeddings | sentence-transformers (all-MiniLM-L6-v2) | In-process, fast batch embedding |
 | Vector store | Postgres + pgvector | Production-grade, one DB for everything |
+| Keyword search | BM25 (from scratch) | Exact-match retrieval without Elasticsearch |
 | PDF parsing | pymupdf / pymupdf4llm | Preserves heading structure for chunking |
 | UI | Gradio | Minimal code, works out of the box |
 | HTTP | Python urllib (stdlib) | No dependencies for LLM calls |
@@ -150,6 +179,28 @@ Open **http://localhost:7860** in your browser.
 
 ## How each component works
 
+### Agent loop (`agent.py`)
+
+The core of the system. For each query, the agent runs four sequential LLM calls:
+
+**1. Tool selection** — the LLM reads the query and picks the best retrieval tool from the registry. Conceptual questions go to vector search. Technical terms and exact names go to BM25 keyword search. References to prior conversation go to memory recall.
+
+**2. Retrieval reflection** — after the tool returns results, the LLM evaluates whether the context is sufficient to answer the question. If not, it rewrites the query with different keywords and retries with the next tool. Up to 3 attempts before falling back.
+
+**3. Answer generation** — the LLM generates an answer using only the retrieved context. If no context was retrieved, it returns an explicit "I don't have information about this" rather than hallucinating from training data.
+
+**4. Self-critique** — a second LLM call evaluates the generated answer. If the answer is vague, misses key aspects, or contradicts the context, it is revised before being returned to the user.
+
+### Tool registry (`tools.py`)
+
+Three tools the agent can select from:
+
+**`vector_search`** — semantic similarity search via pgvector. Finds conceptually similar chunks even when wording differs. Best for most questions.
+
+**`keyword_search`** — BM25 ranking over all parent chunks, implemented from scratch. Finds exact term matches — better for specific constants, version numbers, and proper nouns. BM25 saturates repeated term frequency, making it more robust than raw TF-IDF for long documents.
+
+**`recall_memory`** — searches conversation history for relevant prior turns using term overlap scoring. Used when the user references something discussed earlier.
+
 ### Chunking (`chunker.py`)
 
 PDFs are converted to Markdown using `pymupdf4llm`, which preserves heading structure. The text is then split at H1/H2/H3 headers into **parent chunks** (2,000–10,000 characters). Each parent is further split into **child chunks** (500 characters, 100-character overlap).
@@ -158,23 +209,35 @@ Parent chunks are saved as JSON files. Child chunks are embedded and stored in P
 
 ### Vector search (`vector_store.py`)
 
-Uses `sentence-transformers/all-MiniLM-L6-v2` loaded directly in-process — no HTTP calls. All chunks are embedded in a single batch call at index time. Vectors are stored in Postgres using the `pgvector` extension with an HNSW index for fast approximate nearest-neighbour search.
-
-Search uses cosine similarity via pgvector's `<=>` operator.
+Uses `sentence-transformers/all-MiniLM-L6-v2` loaded directly in-process — no HTTP calls. All chunks are embedded in a single batch call at index time. Vectors are stored in Postgres using the `pgvector` extension with an HNSW index for fast approximate nearest-neighbour search. Search uses cosine similarity via pgvector's `<=>` operator.
 
 ### Query intelligence (`query_intelligence.py`)
 
-Before retrieval, every query is analyzed by the LLM:
+Before the agent loop runs, every query is analysed:
 
 1. **Clarity check** — is the question specific enough to search for?
 2. **Rewriting** — replace pronouns, remove filler, make self-contained
 3. **Splitting** — break multi-topic questions into up to 3 sub-questions
 
-The LLM returns structured JSON which is parsed and used to route the query.
+The LLM returns structured JSON which is parsed and used to route the query into the agent loop.
 
-### Conversation memory (`main.py`)
+### Prompts (`prompts.py`)
 
-The last 10 messages are kept in a rolling window. Before each turn, they are summarized into 1-2 sentences. This summary is passed to the query analyzer to resolve references like "it", "that model", or "the second approach".
+All LLM prompts are centralised in one file. This makes tuning behaviour straightforward — changing a prompt once affects the whole system. The file also documents how many LLM calls happen per query and why each one exists.
+
+### Evaluation (`eval.py`)
+
+Runs a set of questions through the retrieval pipeline and reports:
+- **Retrieval coverage** — did the retriever find any chunks?
+- **Answer informativeness** — did the LLM answer, or fall back to "I don't know"?
+
+No labelled ground truth needed — runs entirely with your local Postgres and Ollama stack.
+
+```bash
+python3 eval.py                        # runs eval_questions.json
+python3 eval.py --verbose              # also prints each answer
+python3 eval.py --questions my_qs.json # custom question file
+```
 
 ---
 
@@ -184,6 +247,8 @@ Key constants you can tune:
 
 | File | Constant | Default | Effect |
 |---|---|---|---|
+| `agent.py` | `MAX_RETRIES` | 3 | Max retrieval attempts before giving up |
+| `agent.py` | `MIN_CONTEXT_CHARS` | 100 | Minimum context length to consider sufficient |
 | `vector_store.py` | `SCORE_THRESHOLD` | 0.3 | Minimum similarity to include a chunk |
 | `vector_store.py` | `DEFAULT_TOP_K` | 7 | How many chunks to retrieve |
 | `rag.py` | `MAX_PARENTS` | 3 | Max parent chunks sent to LLM |
@@ -196,11 +261,11 @@ Key constants you can tune:
 ## Possible improvements
 
 - **Reranking** — add a cross-encoder reranker after retrieval for better precision
-- **Hybrid search** — add BM25 sparse embeddings alongside dense for keyword matching
+- **Streaming** — stream LLM tokens to the Gradio UI as they generate
 - **Persistent sessions** — replace in-memory history with Postgres-backed sessions
-- **Evaluation** — add RAGAS to measure retrieval and answer quality
-- **Streaming** — stream LLM responses token by token for better UX
 - **Multi-user** — add authentication and per-user document namespaces
+- **RAGAS evaluation** — add ground-truth labelled eval for answer quality scoring
+- **Multi-step planning** — ReAct-style planning for complex multi-hop questions
 
 ---
 
