@@ -1,0 +1,14 @@
+{
+  "questions": [
+    "What is retrieval augmented generation?",
+    "How does parent-child chunking work?",
+    "What embedding model is used for vector search?",
+    "How is conversation history handled across turns?",
+    "What happens when a query is unclear or too vague?",
+    "How are sub-questions split and aggregated?",
+    "What is the similarity threshold for including a chunk?",
+    "How does the system avoid hallucination?",
+    "What database is used for storing vectors?",
+    "How do I add my own PDF documents?"
+  ]
+}
