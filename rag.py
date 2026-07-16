@@ -9,8 +9,10 @@ CHANGES FROM ORIGINAL:
     analyze_query → agent.run_agent (tool select → reflect → generate → critique)
 
   The public API is UNCHANGED:
-    retrieve(query)               — still works, calls vector_search directly
-    answer(query, history, ...)   — now routes through the agent loop
+    retrieve(query)               — still works, now uses hybrid_search
+                                     (vector + BM25 fused via RRF) instead
+                                     of plain vector search
+    answer(query, history, ...)   — routes through the agent loop
     stream_answer(...)            — unchanged (Gradio streaming)
 
   Everything else in main.py and the Gradio UI continues to work
@@ -24,22 +26,32 @@ HOW TO UPDATE YOUR REPO:
 
 from query_intelligence import analyze_query, summarize_conversation
 from agent import run_agent
-from vector_store import search
+from vector_store import hybrid_search
 from chunker import load_parent_chunk
 
 
 # ---------------------------------------------------------------------------
-# Retrieval — unchanged public API
+# Retrieval — unchanged public API, now backed by hybrid search
 # ---------------------------------------------------------------------------
 
-def retrieve(query: str, top_k: int = 7, score_threshold: float = 0.3) -> list[dict]:
+def retrieve(query: str, top_k: int = 7) -> list[dict]:
     """
-    Direct vector search — used by eval.py and anywhere that needs
-    retrieval without the full agent loop.
+    Direct hybrid search (vector + BM25, fused via RRF) — used by eval.py
+    and anywhere that needs retrieval without the full agent loop.
 
-    This function is UNCHANGED from the original rag.py.
+    This used to call vector_store.search() (dense-only). It now calls
+    vector_store.hybrid_search() so eval.py measures the same retrieval
+    backend the agent's vector_search/hybrid_search tools use — keeping
+    the two paths in sync.
+
+    Args:
+        query: The search query string.
+        top_k: Max child chunks to consider before loading parents.
+
+    Returns:
+        List of parent chunk dicts: [{parent_id, source, content}, ...]
     """
-    child_results = search(query, top_k=top_k, score_threshold=score_threshold)
+    child_results = hybrid_search(query, top_k=top_k)
     if not child_results:
         return []
 
@@ -59,7 +71,7 @@ def retrieve(query: str, top_k: int = 7, score_threshold: float = 0.3) -> list[d
 
 
 # ---------------------------------------------------------------------------
-# Answer — now routes through the agent
+# Answer — routes through the agent (unchanged)
 # ---------------------------------------------------------------------------
 
 def answer(
@@ -74,7 +86,7 @@ def answer(
       1. Summarise conversation history (for pronoun resolution)
       2. Analyse + rewrite the query via query_intelligence
       3. For each sub-question, run the full agent loop:
-           tool selection → retrieval → reflection → generation → critique
+           tool selection → retrieval → rerank → reflection → generation → critique
       4. If multiple sub-questions, synthesise into one final answer
 
     Args:

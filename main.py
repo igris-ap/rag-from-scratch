@@ -1,37 +1,42 @@
 """
-main.py — Stage 6: Conversation memory + full pipeline.
+main.py — CLI entry point + pipeline wiring.
 
-This is the entry point. It wires together all previous stages:
+FIX (this version):
+  process_turn() previously duplicated an OLD, pre-agentic pipeline
+  inline — direct retrieve() → build_prompt() → chat() → aggregate_answers().
+  That pipeline predates agent.py's tool selection / retrieval reflection /
+  self-critique loop and never called into it. Practically: every answer
+  the Gradio UI and CLI ever produced skipped the agent loop entirely,
+  regardless of what the README describes.
 
-  llm.py               → chat()
+  process_turn() now delegates to rag.answer(), which already handles
+  conversation summarization, query analysis, the full agent loop
+  (tool selection → rerank → reflection → generation → critique) per
+  sub-question, and multi-sub-question synthesis. main.py no longer
+  needs build_prompt / RAG_SYSTEM_PROMPT / aggregate_answers — those
+  belonged to the old inline pipeline this replaces.
+
+  Public API is unchanged: process_turn(user_input, history) still
+  returns (reply, updated_history). app.py needs no changes.
+
+Wires together:
+  llm.py               → chat()               (used by summarizer/analyzer/agent internally)
   chunker.py           → index_all_documents(), convert_all_pdfs()
-  vector_store.py      → setup_db(), store_children(), search()
-  rag.py               → retrieve(), build_prompt(), answer()
-  query_intelligence.py → analyze_query(), summarize_conversation()
-
-The full flow for each user turn:
-
-  1. summarize_conversation()  — compress history into 1-2 sentences
-  2. analyze_query()           — rewrite query, detect if unclear, split if multi-part
-  3. If unclear → ask for clarification, wait for next input
-  4. If clear   → for each sub-question:
-                    retrieve() → build_prompt() → answer()
-  5. If multiple sub-questions → aggregate answers into one response
-  6. Append user + assistant messages to history
-  7. Loop
+  vector_store.py      → setup_db(), store_children()
+  rag.py               → answer()              (routes through the agent loop)
+  query_intelligence.py → analyze_query(), summarize_conversation()  (verbose diagnostics only)
 
 Conversation memory:
   We keep a plain Python list of {"role": ..., "content": ...} dicts.
   That's all memory is — a growing list that we pass around.
   We trim it to the last MAX_HISTORY messages to avoid huge prompts.
-  The summarizer compresses older context into a short string so
-  nothing important is lost when we trim.
+  rag.answer() internally summarizes recent history for context before
+  each agent run.
 """
 
-from llm import chat
 from chunker import convert_all_pdfs, index_all_documents
 from vector_store import setup_db, clear_chunks, store_children
-from rag import retrieve, build_prompt, RAG_SYSTEM_PROMPT
+from rag import answer as rag_answer
 from query_intelligence import analyze_query, summarize_conversation
 
 # ---------------------------------------------------------------------------
@@ -42,143 +47,42 @@ MAX_HISTORY = 10   # keep last N messages in the rolling window
 
 
 # ---------------------------------------------------------------------------
-# Multi-answer aggregation
-# ---------------------------------------------------------------------------
-
-AGGREGATE_SYSTEM_PROMPT = """You are a helpful assistant.
-You have been given multiple answers to different parts of a user's question.
-Combine them into a single, coherent, well-structured response.
-
-Rules:
-- Do not repeat the same information twice
-- Keep the combined answer concise and direct
-- Maintain all source citations from the individual answers
-- Use natural connecting language between sections
-- Do not say "Answer 1" or "Answer 2" — just flow naturally
-"""
-
-
-def aggregate_answers(original_query: str, answers: list[tuple[str, str]]) -> str:
-    """
-    Merge multiple sub-question answers into one coherent response.
-
-    Called only when the query was split into multiple sub-questions.
-    Each answer is independently retrieved and generated — this step
-    weaves them together so the user gets one clean response.
-
-    Args:
-        original_query: The user's original (unsplit) question.
-        answers:        List of (sub_question, answer) tuples.
-
-    Returns:
-        A single merged answer string.
-    """
-    # Build the message showing all sub-answers
-    parts = []
-    for i, (question, answer) in enumerate(answers, 1):
-        parts.append(f"Sub-question {i}: {question}\nAnswer {i}: {answer}")
-
-    combined = "\n\n".join(parts)
-
-    messages = [
-        {"role": "system", "content": AGGREGATE_SYSTEM_PROMPT},
-        {
-            "role": "user",
-            "content": (
-                f"Original question: {original_query}\n\n"
-                f"Individual answers:\n{combined}\n\n"
-                f"Please combine these into one clear response."
-            ),
-        },
-    ]
-
-    return chat(messages)
-
-
-# ---------------------------------------------------------------------------
 # Single turn: process one user message
 # ---------------------------------------------------------------------------
 
-def process_turn(user_input: str, history: list[dict]) -> tuple[str, list[dict]]:
+def process_turn(user_input: str, history: list[dict], verbose: bool = False) -> tuple[str, list[dict]]:
     """
-    Process one user message through the full pipeline.
+    Process one user message through the full agentic pipeline.
 
     Args:
         user_input: The raw text the user typed.
         history:    The conversation history so far (list of message dicts).
                     Modified in-place and returned.
+        verbose:    If True, prints agent step logs (tool selection, rerank,
+                    reflection, generation, critique) to the console.
 
     Returns:
         (assistant_reply, updated_history)
 
-    The history is a list of {"role": ..., "content": ...} dicts.
-    We append the user message and assistant reply to it each turn.
+    rag.answer() internally handles conversation summarization, query
+    analysis/rewriting, clarification requests for unclear queries, the
+    full agent loop (tool selection, rerank, retrieval reflection,
+    generation, self-critique) per sub-question, and synthesis if the
+    query was split into multiple sub-questions.
     """
+    reply = rag_answer(user_input, conversation_history=history, verbose=verbose)
 
-    # --- Step 1: Summarize recent conversation for context ---
-    # Pass only the last MAX_HISTORY messages to the summarizer
-    # so it doesn't get overwhelmed by a long conversation
-    recent = history[-MAX_HISTORY:]
-    conversation_summary = summarize_conversation(recent)
-
-    # --- Step 2: Analyze the query ---
-    analysis = analyze_query(user_input, conversation_summary)
-
-    # --- Step 3: Handle unclear queries ---
-    if not analysis["is_clear"]:
-        clarification = analysis["clarification_needed"]
-        if not clarification:
-            clarification = "Could you please clarify your question?"
-
-        # Add to history and return clarification
-        history.append({"role": "user",      "content": user_input})
-        history.append({"role": "assistant", "content": clarification})
-        return clarification, history
-
-    # --- Step 4: Answer each sub-question ---
-    questions = analysis["questions"]
-    answers   = []
-
-    for question in questions:
-        # Retrieve relevant parent chunks
-        context_chunks = retrieve(question)
-
-        # Build the RAG prompt
-        user_message = build_prompt(question, context_chunks)
-
-        # Generate the answer
-        messages = [
-            {"role": "system", "content": RAG_SYSTEM_PROMPT},
-            # Inject conversation summary so the LLM has context
-            # about what was discussed before
-            *(
-                [{"role": "user", "content": f"[Conversation so far: {conversation_summary}]"},
-                 {"role": "assistant", "content": "Understood, I have context from our conversation."}]
-                if conversation_summary else []
-            ),
-            {"role": "user", "content": user_message},
-        ]
-        reply = chat(messages)
-        answers.append((question, reply))
-
-    # --- Step 5: Aggregate if multiple sub-questions ---
-    if len(answers) == 1:
-        # Single question — use the answer directly
-        final_reply = answers[0][1]
-    else:
-        # Multiple questions — merge into one response
-        final_reply = aggregate_answers(user_input, answers)
-
-    # --- Step 6: Update history ---
-    history.append({"role": "user",      "content": user_input})
-    history.append({"role": "assistant", "content": final_reply})
+    # Update history
+    history.append({"role": "user", "content": user_input})
+    history.append({"role": "assistant", "content": reply})
 
     # Trim history to MAX_HISTORY messages
-    # The summarizer captures older context so we don't lose it
+    # The summarizer (inside rag.answer()) captures older context so we
+    # don't lose it when trimming.
     if len(history) > MAX_HISTORY:
         history = history[-MAX_HISTORY:]
 
-    return final_reply, history
+    return reply, history
 
 
 # ---------------------------------------------------------------------------
@@ -219,7 +123,7 @@ def run():
       'reindex'  → re-run the full indexing pipeline
       'history'  → show the current conversation history
       'clear'    → clear conversation history and start fresh
-      'verbose'  → toggle showing retrieved sources
+      'verbose'  → toggle showing query analysis + agent step logs
       'quit'     → exit
     """
     print("=" * 55)
@@ -278,7 +182,7 @@ def run():
 
         if user_input.lower() == "verbose":
             verbose = not verbose
-            print(f"[Verbose: {'ON — showing retrieved sources' if verbose else 'OFF'}]\n")
+            print(f"[Verbose: {'ON — showing query analysis + agent steps' if verbose else 'OFF'}]\n")
             continue
 
         # --- Process the turn ---
@@ -294,7 +198,7 @@ def run():
                 print(f"  summary:   {summary[:100]}...")
             print()
 
-        reply, history = process_turn(user_input, history)
+        reply, history = process_turn(user_input, history, verbose=verbose)
 
         print(f"\nAssistant: {reply}\n")
 

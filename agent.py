@@ -34,11 +34,14 @@ The full flow:
   query
     │
     ▼
-  [select_tool]         LLM picks: vector_search / keyword_search / recall_memory
-    │
+  [select_tool]         LLM picks: vector_search / keyword_search /
+    │                                hybrid_search / recall_memory
     ▼
   [call_tool]           Execute the selected tool
     │
+    ▼
+  [rerank]               Cross-encoder re-scores + trims the candidate
+    │                     pool the tool returned (see rerank.py)
     ▼
   [reflect_on_retrieval] ──── SUFFICIENT? ────► [generate_answer]
     │                                                    │
@@ -48,13 +51,15 @@ The full flow:
               └───────────────────────────┘     PASS? ──► return answer
                                                 FAIL? ──► revise → return
 
-Each step is a SEPARATE LLM call with a focused prompt.
+Each step is a SEPARATE LLM call with a focused prompt (except rerank,
+which is a local cross-encoder pass — no LLM call needed).
 Single responsibility at every stage — easier to debug, easier to explain.
 """
 
 import json
 from llm import chat
 from tools import call_tool, describe_tools, TOOL_REGISTRY
+from rerank import rerank
 
 
 # ---------------------------------------------------------------------------
@@ -63,6 +68,7 @@ from tools import call_tool, describe_tools, TOOL_REGISTRY
 
 MAX_RETRIES = 3          # max retrieval attempts before giving up
 MIN_CONTEXT_CHARS = 100  # minimum context length to consider "sufficient"
+RERANK_KEEP = 3           # how many candidates survive reranking per attempt
 
 
 # ---------------------------------------------------------------------------
@@ -94,6 +100,9 @@ Examples:
 
   Question: "What is parent-child chunking?"
   → {{"tool": "vector_search", "reason": "Knowledge question with no prior history — use semantic search."}}
+
+  Question: "How does the SCORE_THRESHOLD setting affect what counts as similar enough?"
+  → {{"tool": "hybrid_search", "reason": "Mixes a conceptual question with a specific constant name — combine both signals."}}
 """
 
 
@@ -154,11 +163,30 @@ Retrieved context:
 
 Rules:
 - Return ONLY a JSON object — no explanation, no markdown, no code fences.
-- Format: {{"sufficient": true/false, "reason": "<one sentence>", "rewritten_query": "<query or empty>"}}
-- sufficient: true if the context contains ANY relevant information about the topic in the question.
-- sufficient: false ONLY if the context is completely empty or entirely unrelated to the question.
-- Do NOT set sufficient to false just because the answer is incomplete — partial context is enough.
+- Format: {{"sufficient": true/false, "reason": "<one sentence, in your own words>", "rewritten_query": "<query or empty>"}}
+- sufficient: true if the context discusses, defines, or explains the SAME concept/entity the question
+  asks about — even using different wording, synonyms, or paraphrasing. The context does NOT need to
+  repeat the question's exact words or phrase. Judge by meaning, not by string matching.
+- sufficient: false if the context is about a genuinely different subject with no discussion — direct
+  or paraphrased — of what's being asked. A context about a different named thing (a different constant,
+  a different model, a different section) than the one in the question is NOT sufficient, even if it's
+  in the same general domain.
+- Do NOT set sufficient to false just because the wording differs from the question, or because the
+  answer is incomplete — partial context about the RIGHT subject, described in different words, is enough.
+- Write "reason" as your own one-sentence judgment about THIS specific context — do not reuse stock phrases.
 - rewritten_query: only if sufficient is false, provide a rewritten query. Otherwise return "".
+
+Examples (for illustration only — write your own reasoning for the actual case, don't copy this wording):
+
+  Question: "What is retrieval augmented generation?"
+  Context: explains a method that retrieves relevant documents and feeds them to a language model to
+  ground its output, without using the words "retrieval augmented generation" verbatim.
+  → {{"sufficient": true, "rewritten_query": ""}}  (same concept, different words — this counts)
+
+  Question: "What is the exact value of the SCORE_THRESHOLD constant?"
+  Context: describes an unrelated evaluation policy with no mention, direct or paraphrased, of any
+  similarity threshold or scoring constant.
+  → {{"sufficient": false, "rewritten_query": "SCORE_THRESHOLD value configuration"}}  (genuinely different subject)
 """
 
 
@@ -168,7 +196,7 @@ def reflect_on_retrieval(query: str, context_chunks: list[dict]) -> tuple[bool, 
 
     Args:
         query:          The question being answered.
-        context_chunks: List of retrieved chunk dicts (from call_tool).
+        context_chunks: List of retrieved chunk dicts (from call_tool, post-rerank).
 
     Returns:
         (sufficient, reason, rewritten_query)
@@ -237,7 +265,7 @@ def generate_answer(query: str, context_chunks: list[dict]) -> str:
 
     Args:
         query:          The user's question.
-        context_chunks: The retrieved and reflection-approved context.
+        context_chunks: The retrieved, reranked, and reflection-approved context.
 
     Returns:
         The generated answer as a plain string.
@@ -281,13 +309,18 @@ Rules:
 - passes: true if the answer directly addresses the question, is grounded in context, and has no obvious gaps.
 - passes: false if the answer is vague, misses key aspects, says "I don't know" when context is available,
   contradicts the context, or is too short to be useful.
+- passes: false if the context used doesn't actually cover the specific subject of the question — e.g.
+  the question asks about a specific named thing (a constant, a section, a claim) and the context talks
+  about something else in the same general area instead of that specific thing.
 - issues: if passes is false, briefly describe what's wrong.
-- revised_answer: if passes is false, write a better answer using the same context.
+- revised_answer: if passes is false and a better answer CAN be written from the given context, write it.
+  If the context genuinely does not cover the question's subject (topic mismatch), set revised_answer to
+  exactly: "I don't have information about this in the provided documents."
   If passes is true, return empty string
 - passes: false if the answer contains information that does not appear anywhere in the context summary
   (this means the model used training knowledge instead of the retrieved context). "".
 
-Be constructive — revise rather than reject where possible.
+Be constructive — revise rather than reject where possible, but don't paper over a genuine topic mismatch.
 """
 
 
@@ -387,7 +420,7 @@ def run_agent(
     log(f"Tool selected: {tool_name} — {tool_reason}")
 
     # ------------------------------------------------------------------
-    # Step 2: Retrieval loop with reflection
+    # Step 2: Retrieval loop with rerank + reflection
     # ------------------------------------------------------------------
     current_query = query
     context_chunks = []
@@ -403,7 +436,17 @@ def run_agent(
 
         # Call the selected tool
         results = call_tool(tool_name, current_query, conversation_history=history)
-        log(f"  Retrieved {len(results)} chunk(s)")
+        log(f"  Retrieved {len(results)} candidate(s)")
+
+        # Rerank: cross-encoder re-scores the candidate pool against the
+        # current query and keeps the top RERANK_KEEP. This runs
+        # regardless of which tool was used — vector_search and
+        # hybrid_search return a wider pool specifically so this step
+        # has something to work with; recall_memory / keyword_search
+        # results get reranked too (rerank() only needs a "content" key).
+        if results:
+            results = rerank(current_query, results, top_k=RERANK_KEEP)
+            log(f"  Reranked to top {len(results)}")
 
         # Reflect: is this sufficient?
         sufficient, reason, rewritten_query = reflect_on_retrieval(current_query, results)
@@ -416,9 +459,12 @@ def run_agent(
         # Not sufficient — prepare for next attempt
         tried_tools.append(tool_name)
 
-    # Retry strategy: always try vector_search first if not yet tried,
-    # then keyword_search, then recall_memory as last resort
-        retry_order = ["vector_search", "keyword_search", "recall_memory"]
+        # Retry strategy: always try vector_search first if not yet tried,
+        # then keyword_search, then hybrid_search, then recall_memory as
+        # last resort. hybrid_search sits before recall_memory since it
+        # combines both document-retrieval signals — worth trying before
+        # falling back to conversation history.
+        retry_order = ["vector_search", "keyword_search", "hybrid_search", "recall_memory"]
         next_tool = None
         for t in retry_order:
             if t not in tried_tools:
@@ -429,12 +475,10 @@ def run_agent(
             context_chunks = results
             break
         tool_name = next_tool
-        
+
         # Use the rewritten query if reflection provided one
         if rewritten_query and rewritten_query.strip():
             current_query = rewritten_query
-        
-       
 
     if not context_chunks and results:
         context_chunks = results
@@ -443,7 +487,7 @@ def run_agent(
     # Step 3: Generate answer
     # ------------------------------------------------------------------
     log(f"Generating answer from {len(context_chunks)} chunk(s)...")
-    
+
     if not context_chunks:
         return {
             "answer": "I don't have information about this in the provided documents.",
@@ -454,10 +498,10 @@ def run_agent(
             "critique_notes": "No context retrieved — skipped generation.",
             "context_chunks": [],
         }
-    
+
     answer = generate_answer(query, context_chunks)
     log(f"  Answer generated ({len(answer)} chars)")
-    
+
     # ------------------------------------------------------------------
     # Step 4: Self-critique and revision
     # ------------------------------------------------------------------

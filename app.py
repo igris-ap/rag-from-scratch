@@ -16,9 +16,9 @@ from pathlib import Path
 from llm import chat
 from chunker import convert_all_pdfs, index_all_documents
 from vector_store import setup_db, clear_chunks, store_children
-from rag import retrieve, build_prompt, RAG_SYSTEM_PROMPT
+from rag import retrieve
 from query_intelligence import analyze_query, summarize_conversation
-from main import process_turn, index_documents, MAX_HISTORY, aggregate_answers
+from main import process_turn, index_documents, MAX_HISTORY
 
 
 # ---------------------------------------------------------------------------
@@ -62,8 +62,11 @@ def respond(
     summary  = summarize_conversation(recent)
     analysis = analyze_query(message, summary)
 
-    # Process the turn through the full pipeline
-    reply, conversation_state = process_turn(message, conversation_state)
+    # Process the turn through the full pipeline — verbose mirrors the
+    # "Show query analysis" checkbox, so checking it also prints the
+    # agent's tool-selection / rerank / reflection / critique steps to
+    # the terminal running app.py.
+    reply, conversation_state = process_turn(message, conversation_state, verbose=show_analysis)
 
     # Prepend analysis info if verbose mode is on
     if show_analysis:

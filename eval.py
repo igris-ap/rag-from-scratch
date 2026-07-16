@@ -31,7 +31,7 @@ import time
 import argparse
 from pathlib import Path
 
-from rag import retrieve, answer
+from agent import run_agent
 
 # ---------------------------------------------------------------------------
 # Config
@@ -49,35 +49,54 @@ MIN_CHUNKS_FOR_PASS = 1
 
 def evaluate_question(question: str, verbose: bool = False) -> dict:
     """
-    Run a single question through the RAG pipeline and collect metrics.
+    Run a single question through the agentic RAG pipeline and collect metrics.
+
+    NOTE: This calls agent.run_agent() directly, ONCE, rather than calling
+    rag.retrieve() and rag.answer() separately. The previous version called
+    both independently — retrieve() always ran a direct hybrid_search, while
+    answer() routed through the full agent loop where select_tool() could
+    pick a different tool entirely. That meant the "sources" reported here
+    could describe a completely different retrieval than the one that
+    actually produced the printed answer. Calling run_agent() once and
+    reading its context_chunks guarantees the sources shown are exactly
+    what generated the answer.
+
+    Trade-off: this bypasses rag.answer()'s query-analysis layer (clarity
+    check, multi-question splitting/synthesis) and evaluates each question
+    as a single agent run. Fine for this question set, since none of them
+    are multi-part — but if you add a multi-part question to
+    eval_questions.json, this won't exercise the splitting/synthesis path.
 
     Returns a dict with:
         question        — the input question
-        chunks_retrieved — number of parent chunks returned
-        sources         — list of unique source filenames
+        chunks_retrieved — number of parent chunks used for generation
+        sources         — list of unique source filenames actually used
+        tool_used       — which tool the agent selected
+        retrieval_attempts — how many retrieval attempts were made
         retrieval_pass  — True if >= MIN_CHUNKS_FOR_PASS chunks found
-        answer_has_info — True if the answer is not the fallback "I don't have"
+        answer_has_info — True if the answer is not a fallback "I don't have"
         answer          — the full LLM response
         latency_s       — end-to-end time in seconds
     """
     start = time.time()
 
-    # Step 1: retrieval only (to measure without LLM noise)
-    chunks = retrieve(question)
-    sources = list({c["source"] for c in chunks})
+    agent_result = run_agent(question, verbose=False)
 
-    # Step 2: full answer
-    llm_answer = answer(question, verbose=False)
+    chunks = agent_result["context_chunks"]
+    sources = list({c.get("source", "unknown") for c in chunks})
+    llm_answer = agent_result["answer"]
 
     elapsed = round(time.time() - start, 2)
 
     retrieval_pass = len(chunks) >= MIN_CHUNKS_FOR_PASS
-    answer_has_info = "i don't have enough information" not in llm_answer.lower()
+    answer_has_info = "don't have information" not in llm_answer.lower()
 
     result = {
         "question": question,
         "chunks_retrieved": len(chunks),
         "sources": sources,
+        "tool_used": agent_result["tool_used"],
+        "retrieval_attempts": agent_result["retrieval_attempts"],
         "retrieval_pass": retrieval_pass,
         "answer_has_info": answer_has_info,
         "answer": llm_answer,
@@ -87,6 +106,7 @@ def evaluate_question(question: str, verbose: bool = False) -> dict:
     if verbose:
         status = "PASS" if retrieval_pass else "FAIL"
         print(f"\n[{status}] {question}")
+        print(f"  Tool: {agent_result['tool_used']} ({agent_result['retrieval_attempts']} attempt(s))")
         print(f"  Chunks: {len(chunks)} | Sources: {sources} | {elapsed}s")
         print(f"  Answer: {llm_answer[:200]}{'...' if len(llm_answer) > 200 else ''}")
 

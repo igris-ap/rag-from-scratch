@@ -11,26 +11,38 @@ What is a tool registry?
   tools, and every serious agent framework — we're just doing it without
   a framework.
 
-Why three tools and not just one?
+Why four tools and not just one?
   Vector search (semantic) and keyword search (BM25) retrieve different
   things. Semantic search finds conceptually similar chunks even with
   different wording. BM25 finds exact keyword matches — better for
-  technical terms, proper nouns, version numbers.
+  technical terms, proper nouns, version numbers. hybrid_search fuses
+  both signals (via RRF) in one call for when either alone might miss —
+  the agent can reach for it when it's not confident which single
+  signal will win.
 
   The agent deciding which one to use (or both) is the point. That
   decision-making is what makes it agentic.
 
 Tools defined here:
   1. vector_search   — semantic similarity search via pgvector (existing)
-  2. keyword_search  — BM25 term-frequency keyword search (new)
-  3. recall_memory   — search conversation history for relevant past context (new)
+  2. keyword_search  — BM25 term-frequency keyword search (existing)
+  3. recall_memory   — search conversation history for relevant past context (existing)
+  4. hybrid_search    — fused vector + Postgres full-text search via RRF (new)
+
+Reranking note:
+  Candidate pools below are intentionally wider than what gets returned
+  to generation (agent.py reranks the returned parent chunks down with a
+  cross-encoder before the reflection step). A tool returning only 3
+  candidates gives the reranker nothing to actually re-order — so the
+  parent caps here were bumped from 3 to 8. agent.py trims back down
+  after reranking.
 """
 
 import math
 import json
 from collections import Counter
 
-from vector_store import search
+from vector_store import search, hybrid_search as vector_store_hybrid_search
 from chunker import load_parent_chunk
 
 
@@ -66,6 +78,16 @@ TOOL_REGISTRY = {
         ),
         "input": "query string",
     },
+    "hybrid_search": {
+        "description": (
+            "Combined semantic + keyword search over the indexed documents, "
+            "fusing both signals into one ranking. Best when the question mixes "
+            "a conceptual idea with a specific term (e.g. 'how does the CHUNK_SIZE "
+            "constant affect retrieval quality?'), or when you're not confident "
+            "vector_search or keyword_search alone would find the right chunk."
+        ),
+        "input": "query string",
+    },
 }
 
 
@@ -84,13 +106,17 @@ def describe_tools() -> str:
 # Tool 1: Vector search (semantic)
 # ---------------------------------------------------------------------------
 
-def vector_search(query: str, top_k: int = 7, score_threshold: float = 0.3) -> list[dict]:
+def vector_search(query: str, top_k: int = 15, score_threshold: float = 0.3) -> list[dict]:
     """
     Semantic search via pgvector — the existing retrieval pipeline.
 
     Searches child chunks by cosine similarity, then loads parent chunks
     for full context. This is exactly what rag.py's retrieve() does,
     exposed here as a named tool.
+
+    top_k was bumped from 7 → 15 and the parent cap from 3 → 8 so that
+    agent.py's rerank step has a real pool of candidates to re-order
+    instead of just re-sorting 3 items.
 
     Args:
         query:           The search query string.
@@ -112,7 +138,7 @@ def vector_search(query: str, top_k: int = 7, score_threshold: float = 0.3) -> l
             seen_parent_ids.append(pid)
 
     parents = []
-    for parent_id in seen_parent_ids[:3]:
+    for parent_id in seen_parent_ids[:8]:
         parent = load_parent_chunk(parent_id)
         if parent:
             parents.append(parent)
@@ -244,9 +270,12 @@ def _bm25_score(
     return score
 
 
-def keyword_search(query: str, top_k: int = 3) -> list[dict]:
+def keyword_search(query: str, top_k: int = 8) -> list[dict]:
     """
     BM25 keyword search over all indexed parent chunks.
+
+    top_k was bumped from 3 → 8 for the same reason as vector_search:
+    the reranker downstream needs a real candidate pool.
 
     Args:
         query: The search query. Works best with specific terms.
@@ -345,6 +374,49 @@ def recall_memory(query: str, conversation_history: list[dict], top_k: int = 3) 
 
 
 # ---------------------------------------------------------------------------
+# Tool 4: Hybrid search (vector + BM25, fused via RRF)
+# ---------------------------------------------------------------------------
+
+def hybrid_search(query: str, top_k: int = 8) -> list[dict]:
+    """
+    Fused semantic + keyword search, via vector_store.hybrid_search().
+
+    Unlike vector_search/keyword_search above (which query independently
+    and let the agent's tool-selection loop pick one or retry with the
+    other), this tool runs BOTH signals in one call and fuses their
+    rankings with Reciprocal Rank Fusion (RRF) — see vector_store.py for
+    the fusion details. Useful when the agent isn't confident a single
+    signal will win, or the query mixes a concept with a specific term.
+
+    Args:
+        query: The search query string.
+        top_k: Max number of fused child-chunk results to consider before
+               loading parents.
+
+    Returns:
+        List of parent chunk dicts: [{parent_id, source, content}, ...]
+        Empty list if nothing relevant found.
+    """
+    child_results = vector_store_hybrid_search(query, top_k=top_k)
+    if not child_results:
+        return []
+
+    seen_parent_ids = []
+    for child in child_results:
+        pid = child["parent_id"]
+        if pid not in seen_parent_ids:
+            seen_parent_ids.append(pid)
+
+    parents = []
+    for parent_id in seen_parent_ids[:8]:
+        parent = load_parent_chunk(parent_id)
+        if parent:
+            parents.append(parent)
+
+    return parents
+
+
+# ---------------------------------------------------------------------------
 # Dispatcher — call a tool by name
 # ---------------------------------------------------------------------------
 
@@ -361,7 +433,8 @@ def call_tool(
     of each tool.
 
     Args:
-        tool_name:            One of: "vector_search", "keyword_search", "recall_memory"
+        tool_name:            One of: "vector_search", "keyword_search",
+                               "recall_memory", "hybrid_search"
         query:                The search query.
         conversation_history: Required for recall_memory; ignored by others.
 
@@ -377,6 +450,9 @@ def call_tool(
 
     elif tool_name == "recall_memory":
         return recall_memory(query, conversation_history or [])
+
+    elif tool_name == "hybrid_search":
+        return hybrid_search(query)
 
     else:
         # Unknown tool — return empty rather than crashing
