@@ -24,6 +24,9 @@ parent_store/*
 # Eval output — regenerated on every `python3 eval.py` run
 eval_results.json
 
+# Local agent guidance — not part of the project
+CLAUDE.md
+
 # PDFs (likely private/copyrighted — user adds their own).
 # Exception: the reference fixture backing eval_questions.json.
 docs/*
