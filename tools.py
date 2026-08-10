@@ -40,6 +40,7 @@ Reranking note:
 
 import math
 import json
+import re
 from collections import Counter
 
 from vector_store import search, hybrid_search as vector_store_hybrid_search
@@ -167,6 +168,29 @@ def vector_search(query: str, top_k: int = 15, score_threshold: float = 0.3) -> 
 
 _bm25_index: dict | None = None  # cached index
 
+# Words are runs of letters/digits, optionally joined by internal hyphens so
+# compound technical terms survive as one token ("parent-child",
+# "all-minilm-l6-v2"). Everything else — Markdown emphasis, trailing
+# punctuation, brackets — is a separator.
+_TOKEN_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
+
+
+def _tokenize(text: str) -> list[str]:
+    """
+    Split text into lowercase BM25 terms.
+
+    This replaces a plain `.lower().split()`, which left Markdown and
+    punctuation fused to the words and silently broke matching: the corpus
+    indexed "**rag" and "turns**" and "reply." as distinct terms, while a
+    question ending in "?" produced the term "generation?" that matched
+    nothing in the index. Query and documents must be tokenized the same
+    way for term matching to work at all, so both sides call this.
+
+    Hyphens inside a word are kept, since splitting "parent-child" into two
+    terms would lose the compound the user actually searched for.
+    """
+    return _TOKEN_RE.findall(text.lower())
+
 
 def _build_bm25_index() -> dict:
     """
@@ -195,7 +219,7 @@ def _build_bm25_index() -> dict:
         try:
             with open(filepath) as f:
                 chunk = json.load(f)
-            tokens = chunk.get("content", "").lower().split()
+            tokens = _tokenize(chunk.get("content", ""))
             documents.append({
                 "parent_id": chunk.get("parent_id", filepath.stem),
                 "source": chunk.get("source", "unknown"),
@@ -280,7 +304,7 @@ def keyword_search(query: str, top_k: int = 8) -> list[dict]:
     if not index["documents"]:
         return []
 
-    query_terms = query.lower().split()
+    query_terms = _tokenize(query)
 
     # Score every document
     scored = []
@@ -335,14 +359,16 @@ def recall_memory(query: str, conversation_history: list[dict], top_k: int = 3) 
     if not conversation_history:
         return []
 
-    query_terms = set(query.lower().split())
+    query_terms = set(_tokenize(query))
+    if not query_terms:
+        return []
 
     scored = []
     for turn in conversation_history:
         if turn["role"] not in ("user", "assistant"):
             continue
         content = turn["content"]
-        content_terms = set(content.lower().split())
+        content_terms = set(_tokenize(content))
 
         # Jaccard-like overlap: |query ∩ content| / |query|
         overlap = len(query_terms & content_terms)

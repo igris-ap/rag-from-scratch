@@ -444,8 +444,17 @@ def run_agent(
         attempts += 1
         log(f"Retrieval attempt {attempts}/{MAX_RETRIES} — tool: {tool_name}, query: '{current_query}'")
 
-        # Call the selected tool
-        results = call_tool(tool_name, current_query, conversation_history=history)
+        # Call the selected tool. A tool can fail for reasons that have
+        # nothing to do with the question — Postgres down takes out
+        # vector_search and hybrid_search, while keyword_search (which reads
+        # parent_store/ off disk) still works. Treat a raising tool as "no
+        # results" so the retry loop moves on to the next tool instead of
+        # killing the whole answer.
+        try:
+            results = call_tool(tool_name, current_query, conversation_history=history)
+        except Exception as e:
+            log(f"  Tool '{tool_name}' failed: {type(e).__name__}: {e}")
+            results = []
         log(f"  Retrieved {len(results)} candidate(s)")
 
         # Rerank: cross-encoder re-scores the candidate pool against the
