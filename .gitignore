@@ -11,12 +11,23 @@ build/
 venv/
 env/
 
-# Project-generated folders (large, reconstructable by running the app)
-markdown/
-parent_store/
+# Project-generated folders (large, reconstructable by running the app).
+# Exception: the rag_system_reference fixture is committed on purpose —
+# eval_questions.json is written against it, so eval.py must be
+# reproducible on a fresh clone. Uses `dir/*` (not `dir/`) because git
+# cannot re-include a file whose parent directory is itself excluded.
+markdown/*
+!markdown/rag_system_reference.md
+parent_store/*
+!parent_store/rag_system_reference_*.json
 
-# PDFs (likely private/copyrighted — user adds their own)
-docs/
+# Eval output — regenerated on every `python3 eval.py` run
+eval_results.json
+
+# PDFs (likely private/copyrighted — user adds their own).
+# Exception: the reference fixture backing eval_questions.json.
+docs/*
+!docs/rag_system_reference.pdf
 
 # Jupyter
 .ipynb_checkpoints/

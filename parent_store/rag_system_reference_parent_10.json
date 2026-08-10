@@ -1,0 +1,5 @@
+{
+  "parent_id": "rag_system_reference_parent_10",
+  "source": "rag_system_reference.pdf",
+  "content": "## **How To Add Your Own PDF Documents** \n\nTo add new documents, copy the PDF files into the docs folder in the project directory. After adding files, trigger re-indexing, either by clicking the Re-index button in the web interface, uploading files directly through the interface's upload panel which triggers indexing automatically, or by running the reindex command from the interactive command-line tool. Re-indexing converts every PDF in the docs folder to markdown, splits the markdown into parent and child chunks, embeds the child chunks, and \n\n--- end of page.page_number=2 ---\n\nstores everything fresh in Postgres, replacing whatever was indexed before. \n\n--- end of page.page_number=3 ---"
+}
