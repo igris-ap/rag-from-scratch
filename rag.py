@@ -1,33 +1,19 @@
 """
-rag.py — Updated to route through the agentic core.
+rag.py — Top-level entry points for the agentic RAG pipeline.
 
-CHANGES FROM ORIGINAL:
-  The original rag.py had a fixed pipeline:
-    analyze_query → retrieve → generate
-
-  This version routes through agent.py instead:
-    analyze_query → agent.run_agent (tool select → reflect → generate → critique)
-
-  The public API is UNCHANGED:
-    retrieve(query)               — still works, now uses hybrid_search
-                                     (vector + BM25 fused via RRF) instead
-                                     of plain vector search
-    answer(query, history, ...)   — routes through the agent loop
-    stream_answer(...)            — unchanged (Gradio streaming)
-
-  Everything else in main.py and the Gradio UI continues to work
-  without any modifications.
-
-HOW TO UPDATE YOUR REPO:
-  Replace the body of the answer() function in your existing rag.py
-  with the version here. Or replace the whole file — the interface is
-  identical so nothing else needs changing.
+  retrieve(query)             — direct hybrid search (vector + BM25 via RRF),
+                                 used by eval.py and anywhere that needs
+                                 retrieval without the full agent loop.
+  answer(query, history, ...) — analyze_query() → agent.run_agent()
+                                 (tool select → reflect → generate → critique)
+                                 for each sub-question, then synthesise.
+  stream_answer(...)          — Gradio streaming helper.
 """
 
 from query_intelligence import analyze_query, summarize_conversation
 from agent import run_agent
 from vector_store import hybrid_search
-from chunker import load_parent_chunk
+from chunker import parents_from_child_results
 
 
 # ---------------------------------------------------------------------------
@@ -52,22 +38,7 @@ def retrieve(query: str, top_k: int = 7) -> list[dict]:
         List of parent chunk dicts: [{parent_id, source, content}, ...]
     """
     child_results = hybrid_search(query, top_k=top_k)
-    if not child_results:
-        return []
-
-    seen_parent_ids = []
-    for child in child_results:
-        pid = child["parent_id"]
-        if pid not in seen_parent_ids:
-            seen_parent_ids.append(pid)
-
-    parents = []
-    for parent_id in seen_parent_ids[:3]:
-        parent = load_parent_chunk(parent_id)
-        if parent:
-            parents.append(parent)
-
-    return parents
+    return parents_from_child_results(child_results, limit=3)
 
 
 # ---------------------------------------------------------------------------
@@ -78,7 +49,7 @@ def answer(
     user_query: str,
     conversation_history: list[dict] | None = None,
     verbose: bool = False,
-) -> str:
+) -> tuple[str, dict]:
     """
     Generate an answer for the user's query using the agentic RAG loop.
 
@@ -95,7 +66,12 @@ def answer(
         verbose:              If True, print agent step logs to console.
 
     Returns:
-        Final answer string.
+        (final_answer, analysis_info)
+        analysis_info: {"is_clear": bool, "questions": list[str], "summary": str}
+        — the query-analysis result, returned so callers that want to
+          display it (verbose CLI, Gradio "show query analysis") don't
+          need to call summarize_conversation()/analyze_query() a second
+          time themselves.
     """
     history = conversation_history or []
 
@@ -106,16 +82,20 @@ def answer(
 
     # Step 2: Analyse and rewrite the query
     analysis = analyze_query(user_query, conversation_summary=summary)
+    analysis_info = {
+        "is_clear": analysis["is_clear"],
+        "questions": analysis["questions"],
+        "summary": summary,
+    }
 
     # If unclear, return the clarification request immediately
     if not analysis["is_clear"]:
-        return analysis["clarification_needed"]
+        return analysis["clarification_needed"], analysis_info
 
     questions = analysis["questions"]
 
     # Step 3: Run agent loop for each sub-question
     sub_answers = []
-    all_context = []
 
     for q in questions:
         if verbose:
@@ -123,7 +103,6 @@ def answer(
 
         result = run_agent(q, conversation_history=history, verbose=verbose)
         sub_answers.append(result["answer"])
-        all_context.extend(result["context_chunks"])
 
         if verbose:
             print(f"[rag] Tool used: {result['tool_used']} ({result['retrieval_attempts']} attempt(s))")
@@ -131,10 +110,10 @@ def answer(
 
     # Step 4: If only one sub-question, return its answer directly
     if len(sub_answers) == 1:
-        return sub_answers[0]
+        return sub_answers[0], analysis_info
 
     # Step 5: Synthesise multiple sub-answers into one coherent response
-    return _synthesise(user_query, questions, sub_answers)
+    return _synthesise(user_query, questions, sub_answers), analysis_info
 
 
 def _synthesise(
@@ -175,7 +154,6 @@ def _synthesise(
         },
     ]
 
-    from llm import chat
     return chat(messages, temperature=0.0)
 
 
@@ -198,7 +176,7 @@ def stream_answer(
         for chunk in stream_answer(query, history):
             yield chunk
     """
-    full_answer = answer(user_query, conversation_history)
+    full_answer, _ = answer(user_query, conversation_history)
 
     # Stream word by word
     words = full_answer.split(" ")

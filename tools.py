@@ -43,7 +43,7 @@ import json
 from collections import Counter
 
 from vector_store import search, hybrid_search as vector_store_hybrid_search
-from chunker import load_parent_chunk
+from chunker import parents_from_child_results
 
 
 # ---------------------------------------------------------------------------
@@ -128,22 +128,7 @@ def vector_search(query: str, top_k: int = 15, score_threshold: float = 0.3) -> 
         Empty list if nothing relevant found.
     """
     child_results = search(query, top_k=top_k, score_threshold=score_threshold)
-    if not child_results:
-        return []
-
-    seen_parent_ids = []
-    for child in child_results:
-        pid = child["parent_id"]
-        if pid not in seen_parent_ids:
-            seen_parent_ids.append(pid)
-
-    parents = []
-    for parent_id in seen_parent_ids[:8]:
-        parent = load_parent_chunk(parent_id)
-        if parent:
-            parents.append(parent)
-
-    return parents
+    return parents_from_child_results(child_results, limit=8)
 
 
 # ---------------------------------------------------------------------------
@@ -398,22 +383,7 @@ def hybrid_search(query: str, top_k: int = 8) -> list[dict]:
         Empty list if nothing relevant found.
     """
     child_results = vector_store_hybrid_search(query, top_k=top_k)
-    if not child_results:
-        return []
-
-    seen_parent_ids = []
-    for child in child_results:
-        pid = child["parent_id"]
-        if pid not in seen_parent_ids:
-            seen_parent_ids.append(pid)
-
-    parents = []
-    for parent_id in seen_parent_ids[:8]:
-        parent = load_parent_chunk(parent_id)
-        if parent:
-            parents.append(parent)
-
-    return parents
+    return parents_from_child_results(child_results, limit=8)
 
 
 # ---------------------------------------------------------------------------

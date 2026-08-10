@@ -1,30 +1,16 @@
 """
 main.py — CLI entry point + pipeline wiring.
 
-FIX (this version):
-  process_turn() previously duplicated an OLD, pre-agentic pipeline
-  inline — direct retrieve() → build_prompt() → chat() → aggregate_answers().
-  That pipeline predates agent.py's tool selection / retrieval reflection /
-  self-critique loop and never called into it. Practically: every answer
-  the Gradio UI and CLI ever produced skipped the agent loop entirely,
-  regardless of what the README describes.
-
-  process_turn() now delegates to rag.answer(), which already handles
-  conversation summarization, query analysis, the full agent loop
-  (tool selection → rerank → reflection → generation → critique) per
-  sub-question, and multi-sub-question synthesis. main.py no longer
-  needs build_prompt / RAG_SYSTEM_PROMPT / aggregate_answers — those
-  belonged to the old inline pipeline this replaces.
-
-  Public API is unchanged: process_turn(user_input, history) still
-  returns (reply, updated_history). app.py needs no changes.
+process_turn() delegates to rag.answer(), which handles conversation
+summarization, query analysis, the full agent loop (tool selection →
+rerank → reflection → generation → critique) per sub-question, and
+multi-sub-question synthesis. app.py (Gradio) calls process_turn() too,
+so the CLI and the UI always share one code path.
 
 Wires together:
-  llm.py               → chat()               (used by summarizer/analyzer/agent internally)
-  chunker.py           → index_all_documents(), convert_all_pdfs()
-  vector_store.py      → setup_db(), store_children()
-  rag.py               → answer()              (routes through the agent loop)
-  query_intelligence.py → analyze_query(), summarize_conversation()  (verbose diagnostics only)
+  chunker.py       → index_all_documents(), convert_all_pdfs()
+  vector_store.py  → setup_db(), store_children()
+  rag.py           → answer()   (routes through the agent loop)
 
 Conversation memory:
   We keep a plain Python list of {"role": ..., "content": ...} dicts.
@@ -37,7 +23,6 @@ Conversation memory:
 from chunker import convert_all_pdfs, index_all_documents
 from vector_store import setup_db, clear_chunks, store_children
 from rag import answer as rag_answer
-from query_intelligence import analyze_query, summarize_conversation
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -50,7 +35,9 @@ MAX_HISTORY = 10   # keep last N messages in the rolling window
 # Single turn: process one user message
 # ---------------------------------------------------------------------------
 
-def process_turn(user_input: str, history: list[dict], verbose: bool = False) -> tuple[str, list[dict]]:
+def process_turn(
+    user_input: str, history: list[dict], verbose: bool = False
+) -> tuple[str, list[dict], dict]:
     """
     Process one user message through the full agentic pipeline.
 
@@ -62,7 +49,11 @@ def process_turn(user_input: str, history: list[dict], verbose: bool = False) ->
                     reflection, generation, critique) to the console.
 
     Returns:
-        (assistant_reply, updated_history)
+        (assistant_reply, updated_history, analysis_info)
+        analysis_info is rag.answer()'s query-analysis result — callers
+        that want to display it (verbose CLI, Gradio "show query analysis")
+        should use this instead of calling analyze_query()/
+        summarize_conversation() again themselves.
 
     rag.answer() internally handles conversation summarization, query
     analysis/rewriting, clarification requests for unclear queries, the
@@ -70,7 +61,7 @@ def process_turn(user_input: str, history: list[dict], verbose: bool = False) ->
     generation, self-critique) per sub-question, and synthesis if the
     query was split into multiple sub-questions.
     """
-    reply = rag_answer(user_input, conversation_history=history, verbose=verbose)
+    reply, analysis = rag_answer(user_input, conversation_history=history, verbose=verbose)
 
     # Update history
     history.append({"role": "user", "content": user_input})
@@ -82,7 +73,7 @@ def process_turn(user_input: str, history: list[dict], verbose: bool = False) ->
     if len(history) > MAX_HISTORY:
         history = history[-MAX_HISTORY:]
 
-    return reply, history
+    return reply, history, analysis
 
 
 # ---------------------------------------------------------------------------
@@ -186,19 +177,15 @@ def run():
             continue
 
         # --- Process the turn ---
+        reply, history, analysis = process_turn(user_input, history, verbose=verbose)
+
         if verbose:
-            # Show what the query analyzer decided
-            recent  = history[-MAX_HISTORY:]
-            summary = summarize_conversation(recent)
-            analysis = analyze_query(user_input, summary)
             print(f"\n[Query analysis]")
             print(f"  is_clear:  {analysis['is_clear']}")
             print(f"  questions: {analysis['questions']}")
-            if summary:
-                print(f"  summary:   {summary[:100]}...")
+            if analysis["summary"]:
+                print(f"  summary:   {analysis['summary'][:100]}...")
             print()
-
-        reply, history = process_turn(user_input, history, verbose=verbose)
 
         print(f"\nAssistant: {reply}\n")
 

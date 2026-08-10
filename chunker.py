@@ -339,6 +339,40 @@ def load_parent_chunk(parent_id: str, store_dir: str = PARENT_STORE_DIR) -> dict
         return json.load(f)
 
 
+def parents_from_child_results(child_results: list[dict], limit: int) -> list[dict]:
+    """
+    Turn ranked child-chunk search results into their parent chunks.
+
+    Dedupes by parent_id (keeping first-seen order, i.e. best rank first),
+    then loads up to `limit` parents from disk. Shared by every retrieval
+    path — rag.retrieve() and tools.vector_search()/hybrid_search() — so
+    the child-to-parent resolution logic lives in exactly one place.
+
+    Args:
+        child_results: List of child chunk dicts, each with a "parent_id" key.
+        limit:         Max number of parent chunks to load.
+
+    Returns:
+        List of parent chunk dicts: [{parent_id, source, content}, ...]
+    """
+    if not child_results:
+        return []
+
+    seen_parent_ids = []
+    for child in child_results:
+        pid = child["parent_id"]
+        if pid not in seen_parent_ids:
+            seen_parent_ids.append(pid)
+
+    parents = []
+    for parent_id in seen_parent_ids[:limit]:
+        parent = load_parent_chunk(parent_id)
+        if parent:
+            parents.append(parent)
+
+    return parents
+
+
 # ---------------------------------------------------------------------------
 # Master function: run the full pipeline for all documents
 # ---------------------------------------------------------------------------

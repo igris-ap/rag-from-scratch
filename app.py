@@ -13,12 +13,9 @@ import os
 import shutil
 from pathlib import Path
 
-from llm import chat
 from chunker import convert_all_pdfs, index_all_documents
 from vector_store import setup_db, clear_chunks, store_children
-from rag import retrieve
-from query_intelligence import analyze_query, summarize_conversation
-from main import process_turn, index_documents, MAX_HISTORY
+from main import process_turn, index_documents
 
 
 # ---------------------------------------------------------------------------
@@ -57,16 +54,14 @@ def respond(
     if not message.strip():
         return "", chat_history, conversation_state
 
-    # Query analysis for verbose mode
-    recent   = conversation_state[-MAX_HISTORY:]
-    summary  = summarize_conversation(recent)
-    analysis = analyze_query(message, summary)
-
     # Process the turn through the full pipeline — verbose mirrors the
     # "Show query analysis" checkbox, so checking it also prints the
     # agent's tool-selection / rerank / reflection / critique steps to
-    # the terminal running app.py.
-    reply, conversation_state = process_turn(message, conversation_state, verbose=show_analysis)
+    # the terminal running app.py. analysis is rag.answer()'s own
+    # query-analysis result, not a second recomputation of it.
+    reply, conversation_state, analysis = process_turn(
+        message, conversation_state, verbose=show_analysis
+    )
 
     # Prepend analysis info if verbose mode is on
     if show_analysis:
@@ -75,8 +70,8 @@ def respond(
             f"> - Clear: `{analysis['is_clear']}`\n"
             f"> - Sub-questions: `{analysis['questions']}`\n\n"
         )
-        if summary:
-            analysis_md += f"> - Summary: _{summary[:120]}_\n\n"
+        if analysis["summary"]:
+            analysis_md += f"> - Summary: _{analysis['summary'][:120]}_\n\n"
         display_reply = analysis_md + reply
     else:
         display_reply = reply
