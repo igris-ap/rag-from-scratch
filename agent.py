@@ -70,6 +70,13 @@ MAX_RETRIES = 3          # max retrieval attempts before giving up
 MIN_CONTEXT_CHARS = 100  # minimum context length to consider "sufficient"
 RERANK_KEEP = 3           # how many candidates survive reranking per attempt
 
+# The exact sentence the agent emits when it cannot answer from context.
+# Defined once and injected into the prompts below (and returned directly
+# when retrieval found nothing) so the generation prompt, the critique
+# prompt, the no-context return, and eval.py's fallback detection can
+# never drift apart. eval.py imports this — don't inline the string.
+NO_CONTEXT_ANSWER = "I don't have information about this in the provided documents."
+
 
 # ---------------------------------------------------------------------------
 # Step 1: Tool selection
@@ -252,7 +259,7 @@ def reflect_on_retrieval(query: str, context_chunks: list[dict]) -> tuple[bool, 
 
 GENERATION_PROMPT = """You are a question-answering assistant with access ONLY to the retrieved context below.
 You have no other knowledge. If the context does not contain information relevant to the question, 
-you MUST respond with exactly: "I don't have information about this in the provided documents."
+you MUST respond with exactly: "{fallback}"
 Do not use any knowledge from your training. Only use what is in the context.
 
 Context:
@@ -281,7 +288,9 @@ def generate_answer(query: str, context_chunks: list[dict]) -> str:
     messages = [
         {
             "role": "system",
-            "content": GENERATION_PROMPT.format(context=context_str),
+            "content": GENERATION_PROMPT.format(
+                context=context_str, fallback=NO_CONTEXT_ANSWER
+            ),
         },
         {"role": "user", "content": query},
     ]
@@ -315,7 +324,7 @@ Rules:
 - issues: if passes is false, briefly describe what's wrong.
 - revised_answer: if passes is false and a better answer CAN be written from the given context, write it.
   If the context genuinely does not cover the question's subject (topic mismatch), set revised_answer to
-  exactly: "I don't have information about this in the provided documents."
+  exactly: "{fallback}"
   If passes is true, return empty string
 - passes: false if the answer contains information that does not appear anywhere in the context summary
   (this means the model used training knowledge instead of the retrieved context). "".
@@ -354,6 +363,7 @@ def critique_and_revise(
                 question=query,
                 answer=answer,
                 context_summary=context_summary,
+                fallback=NO_CONTEXT_ANSWER,
             ),
         },
         {"role": "user", "content": "Evaluate this answer."},
@@ -490,7 +500,7 @@ def run_agent(
 
     if not context_chunks:
         return {
-            "answer": "I don't have information about this in the provided documents.",
+            "answer": NO_CONTEXT_ANSWER,
             "tool_used": tool_name,
             "tool_reason": tool_reason,
             "retrieval_attempts": attempts,

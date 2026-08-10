@@ -31,7 +31,7 @@ import time
 import argparse
 from pathlib import Path
 
-from agent import run_agent
+from agent import run_agent, NO_CONTEXT_ANSWER
 
 # ---------------------------------------------------------------------------
 # Config
@@ -42,6 +42,47 @@ OUTPUT_FILE = "eval_results.json"
 
 # A question "passes" retrieval if at least this many chunks are found
 MIN_CHUNKS_FOR_PASS = 1
+
+# An answer that merely *mentions* the fallback sentence is not a fallback.
+# Below this length, a full-text match is still treated as one (covers the
+# LLM prefixing the sentinel with something like "Answer: ").
+SHORT_ANSWER_CHARS = 200
+
+# Match on the sentinel's opening clause rather than the whole sentence, so
+# a decline still registers if the LLM truncates or lightly rewords the tail
+# ("...about this" / "...about that topic"). Derived from the constant so it
+# tracks any future edit to NO_CONTEXT_ANSWER.
+_SENTINEL_PREFIX = " ".join(NO_CONTEXT_ANSWER.lower().split()[:4])
+
+
+def is_fallback_answer(answer: str) -> bool:
+    """
+    Did the agent decline to answer, rather than answer the question?
+
+    Detects the sentinel that agent.py emits (NO_CONTEXT_ANSWER) when no
+    usable context was retrieved.
+
+    Why not a plain substring check?
+      The previous version tested `"don't have information" in answer`.
+      That misfires on any answer that legitimately *quotes* the fallback
+      while explaining it. Concretely: "How does the system avoid
+      hallucination?" produces a fully correct, well-grounded answer that
+      describes the self-critique step "...replaced with an honest
+      'I don't have information about this' response" — and the substring
+      check scored that correct answer as a failure.
+
+      Anchoring on the *start* of the answer fixes it: a real fallback
+      opens with the sentinel, whereas a descriptive mention is buried
+      mid-text.
+    """
+    normalized = answer.strip().lstrip("\"'").lower()
+
+    if normalized.startswith(_SENTINEL_PREFIX):
+        return True
+
+    # Very short answers containing the sentinel anywhere are declines too —
+    # nothing substantive can be wrapped around it at that length.
+    return len(answer) < SHORT_ANSWER_CHARS and _SENTINEL_PREFIX in normalized
 
 # ---------------------------------------------------------------------------
 # Evaluation logic
@@ -89,7 +130,7 @@ def evaluate_question(question: str, verbose: bool = False) -> dict:
     elapsed = round(time.time() - start, 2)
 
     retrieval_pass = len(chunks) >= MIN_CHUNKS_FOR_PASS
-    answer_has_info = "don't have information" not in llm_answer.lower()
+    answer_has_info = not is_fallback_answer(llm_answer)
 
     result = {
         "question": question,
